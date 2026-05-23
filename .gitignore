@@ -1,0 +1,78 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Docker
+.dockerignore
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Misc
+.cache/
+.temp/
+.ruff_cache/
+
+# VK Mini App specific
+vk-mini-app/node_modules/
+vk-mini-app/dist/
+vk-mini-app/build/
+
+# Python backend
+web-app-backend/__pycache__/
+web-app-backend/*.pyc
+web-app-backend/.pytest_cache/
+web-app-backend/.coverage
+
+# Bot service
+vk-bot/__pycache__/
+vk-bot/*.pyc
+
+# Communication service
+communication-service/__pycache__/
+communication-service/*.pyc
+
+# Report service
+report-service/__pycache__/
+report-service/*.pyc
+
+# Supplier finder
+supplier-finder/__pycache__/
+supplier-finder/*.pyc

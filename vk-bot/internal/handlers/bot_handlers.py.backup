@@ -1,0 +1,427 @@
+"""Bot message handlers — modern, professional UX."""
+
+import logging
+import httpx
+from typing import Optional
+from datetime import datetime
+
+from vkbottle.bot import Message
+from vkbottle.tools import CtxStorage
+
+from ..domain.models import User
+from ..repository.postgres import PostgresRepository
+from ..repository.redis import RedisRepositoryImpl
+from ..services.excel_parser import ExcelParser
+from ..keyboards.keyboards import (
+    main_menu,
+    confirm_create,
+    cancel,
+    rfq_list,
+    rfq_detail,
+    item_nav,
+    report_action,
+)
+
+logger = logging.getLogger(__name__)
+ctx = CtxStorage()
+
+
+def _progress_bar(current, total, width=10):
+    if total == 0:
+        return "—" * width
+    filled = int(current / total * width)
+    return "■" * filled + "—" * (width - filled)
+
+
+class BotHandlers:
+    def __init__(
+        self, pg: PostgresRepository, redis_repo: RedisRepositoryImpl, report_url: str
+    ):
+        self.pg = pg
+        self.redis = redis_repo
+        self.report_url = report_url
+        self.parser = ExcelParser()
+
+    async def start_handler(self, message: Message):
+        first_name = "Пользователь"
+        try:
+            users = await message.ctx_api.users.get(message.from_id)
+            if users:
+                first_name = users[0].first_name
+        except Exception:
+            pass
+        await self._get_or_create_user(message.from_id, first_name)
+        await message.answer(
+            f"Здравствуйте, {first_name}.\n\n"
+            "Я помогаю собирать коммерческие предложения от поставщиков.\n\n"
+            "Действия:\n"
+            "  ➕ Новая заявка — загрузите Excel\n"
+            "  📋 Мои заявки — список всех заявок\n"
+            "  📊 Статус последней заявки\n"
+            "  📄 Получить отчёт — Excel-файл\n\n"
+            "Выберите действие в меню ниже:",
+            keyboard=main_menu(),
+        )
+
+    async def my_rfqs_handler(self, message: Message):
+        # Очищаем состояния при входе в список
+        ctx.delete("state")
+        ctx.delete("viewing_rfq")
+        ctx.delete("viewing_index")
+
+        user = await self.pg.get_user(message.from_id)
+        if not user:
+            await message.answer("Напишите «начать», чтобы начать.", keyboard=main_menu())
+            return
+
+        rfqs = await self.pg.get_user_rfqs(message.from_id)
+        if not rfqs:
+            await message.answer(
+                "Заявок пока нет.\nСоздайте новую — нажмите «➕ Новая заявка».",
+                keyboard=main_menu(),
+            )
+            return
+
+        lines = ["Мои заявки:\n"]
+        for rfq in rfqs:
+            bar = _progress_bar(rfq["winner_count"], rfq["items_count"])
+            done = rfq["winner_count"] == rfq["items_count"]
+            created = ""
+            if isinstance(rfq.get("created_at"), datetime):
+                created = rfq["created_at"].strftime("%d.%m.%Y")
+            elif rfq.get("created_at"):
+                created = str(rfq["created_at"])[:10]
+            status = "✅ завершена" if done else "🔄 в работе"
+            lines.append(
+                f"📋 Заявка #{rfq['id']} — {rfq['items_count']} поз.\n"
+                f"  {bar} {rfq['winner_count']}/{rfq['items_count']} — {status}\n"
+                f"  {created}, {rfq.get('city', '—')}\n"
+            )
+
+        await message.answer("\n".join(lines), keyboard=rfq_list(rfqs))
+
+    async def status_handler(self, message: Message, rfq_id: int = None, from_detail: bool = False):
+        user = await self.pg.get_user(message.from_id)
+        if not user:
+            await message.answer("Напишите «начать», чтобы начать.", keyboard=main_menu())
+            return
+
+        if rfq_id is None:
+            rfq = await self.pg.get_latest_rfq_for_user(user.vk_id)
+            if not rfq:
+                await message.answer("Нет активных заявок.", keyboard=main_menu())
+                return
+            rfq_id = rfq.rfq_id
+
+        status = await self.pg.get_rfq_status(rfq_id)
+        items = await self.pg.get_rfq_items_status(rfq_id)
+        suppliers = await self.pg.get_rfq_supplier_summary(rfq_id)
+
+        total = status["total"]
+        quoted = status["quoted"]
+        winners = status["winners"]
+        bar = _progress_bar(winners, total)
+        ready = winners == total and total > 0
+
+        lines = [
+            f"📊 Заявка #{rfq_id}\n",
+            f"{bar} {winners}/{total} победителей\n",
+        ]
+
+        if total > 0:
+            lines.append(f"Котировки: {quoted}/{total}\n")
+            lines.append(f"Осталось: {total - quoted}\n")
+
+        if suppliers:
+            lines.append(f"Поставщиков: {len(suppliers)}\n")
+
+        min_prices = [it.get("min_price") for it in items if it.get("min_price")]
+        if min_prices:
+            lines.append(f"Диапазон цен: {min(min_prices):,.2f} — {max(min_prices):,.2f}\n")
+
+        if ready:
+            lines.append("\n✅ Статус: завершено")
+        else:
+            lines.append("\n🔄 Статус: в работе")
+
+        if from_detail:
+            kb = rfq_detail(rfq_id)
+        else:
+            kb = report_action(rfq_id, ready)
+        await message.answer("\n".join(lines), keyboard=kb)
+
+    async def report_handler(self, message: Message, rfq_id: int = None):
+        user = await self.pg.get_user(message.from_id)
+        if not user:
+            await message.answer("Напишите «начать», чтобы начать.", keyboard=main_menu())
+            return
+
+        if rfq_id is None:
+            rfq = await self.pg.get_latest_rfq_for_user(user.vk_id)
+            if not rfq:
+                await message.answer("Нет заявок.", keyboard=main_menu())
+                return
+            rfq_id = rfq.rfq_id
+
+        status = await self.pg.get_rfq_status(rfq_id)
+        ready = status["winners"] == status["total"] and status["total"] > 0
+
+        await message.answer("Генерирую отчёт. Это может занять до минуты.", keyboard=report_action(rfq_id, ready) if not ready else None)
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{self.report_url}/report/{rfq_id}/generate", timeout=60.0
+                )
+                if resp.status_code == 200:
+                    import tempfile
+
+                    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+                        f.write(resp.content)
+                        temp_path = f.name
+
+                    upload_resp = await message.ctx_api.request(
+                        "docs.getUploadServer", {"peer_id": message.peer_id}
+                    )
+                    upload_url = upload_resp["upload_url"]
+
+                    with open(temp_path, "rb") as file_obj:
+                        files = {"file": file_obj}
+                        upload = await httpx.post(upload_url, files=files)
+                        upload_data = upload.json()
+
+                    doc = await message.ctx_api.request(
+                        "docs.save",
+                        {
+                            "file": upload_data["file"],
+                            "title": f"report_{rfq_id}.xlsx",
+                        },
+                    )
+
+                    status = await self.pg.get_rfq_status(rfq_id)
+                    await message.answer(
+                        f"Отчёт по заявке #{rfq_id}\n"
+                        f"Позиций: {status['total']} | Победителей: {status['winners']}",
+                        attachment=f"doc{doc['doc']['owner_id']}_{doc['doc']['id']}",
+                    )
+
+                    import os
+                    os.unlink(temp_path)
+                else:
+                    await message.answer(
+                        f"Ошибка генерации отчёта (код {resp.status_code})"
+                    )
+        except Exception as e:
+            logger.exception(f"Report generation failed: {e}")
+            await message.answer("Ошибка при генерации отчёта. Попробуйте позже.")
+
+    async def new_rfq_handler(self, message: Message):
+        ctx.set("state", "waiting_file")
+        await message.answer(
+            "Загрузите Excel-файл (.xlsx) со спецификацией.\n\n"
+            "Требуемые столбцы:\n"
+            "  Наименование МТР\n"
+            "  Количество\n"
+            "  Срок поставки\n\n"
+            "Формат даты: 25.03.2026 или 25 Mar 2026",
+            keyboard=cancel(),
+        )
+
+    async def file_handler(self, message: Message):
+        state = ctx.get("state")
+        if state != "waiting_file":
+            return
+
+        doc = None
+        for attachment in message.attachments:
+            if attachment.type.value == "doc":
+                doc = attachment.doc
+                break
+
+        if not doc:
+            await message.answer("Прикрепите Excel-файл (.xlsx).", keyboard=cancel())
+            return
+
+        if not doc.title.endswith(".xlsx"):
+            await message.answer("Поддерживается только формат .xlsx.", keyboard=cancel())
+            return
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                doc.url,
+                headers={"User-Agent": "Mozilla/5.0"},
+                follow_redirects=True,
+            )
+
+        if resp.status_code != 200:
+            await message.answer(f"Не удалось скачать файл (код {resp.status_code}).", keyboard=cancel())
+            return
+
+        content = resp.content
+        if len(content) < 100 or content[:2] != b"PK":
+            try:
+                api_resp = await message.ctx_api.request(
+                    "docs.getDownloadUrl", {"doc_id": doc.id}
+                )
+                dl_url = api_resp.get("link", "")
+                if dl_url:
+                    async with httpx.AsyncClient() as client2:
+                        resp2 = await client2.get(
+                            dl_url,
+                            headers={"User-Agent": "Mozilla/5.0"},
+                            follow_redirects=True,
+                        )
+                        if resp2.status_code == 200:
+                            content = resp2.content
+            except Exception:
+                pass
+
+        if len(content) < 100 or content[:2] != b"PK":
+            await message.answer(
+                "Файл повреждён или это не Excel. Проверьте формат .xlsx.",
+                keyboard=cancel(),
+            )
+            return
+
+        await message.answer("Обрабатываю файл...", keyboard=cancel())
+
+        try:
+            items, city, total_budget = self.parser.parse(content)
+        except Exception as e:
+            await message.answer(f"Ошибка при обработке файла: {e}", keyboard=cancel())
+            return
+
+        if len(items) > 100:
+            await message.answer("Слишком много позиций — максимум 100.", keyboard=cancel())
+            return
+
+        if len(items) == 0:
+            await message.answer(
+                "В файле не найдено данных. Проверьте формат.",
+                keyboard=cancel(),
+            )
+            return
+
+        preview_lines = []
+        for i, it in enumerate(items[:5]):
+            d = it["deadline"]
+            if isinstance(d, datetime):
+                deadline_str = d.strftime("%d.%m.%Y")
+            else:
+                deadline_str = str(d)
+            preview_lines.append(
+                f"{i+1}. {it['name'][:40]} — {it['qty']} {it.get('unit', 'шт')} — {deadline_str}"
+            )
+
+        summary = f"Найдено {len(items)} позиций:\n\n" + "\n".join(preview_lines)
+        if len(items) > 5:
+            summary += f"\n...и ещё {len(items) - 5} позиций"
+
+        summary += f"\n\nГород: {city or 'не указан'}"
+        if total_budget:
+            try:
+                summary += f"\nБюджет: {float(total_budget):,.2f}"
+            except (ValueError, TypeError):
+                summary += f"\nБюджет: {total_budget}"
+
+        ctx.set("pending_items", items)
+        ctx.set("pending_city", city or "Москва")
+        ctx.set("pending_budget", total_budget)
+
+        await message.answer(
+            summary + "\n\nСоздать заявку?",
+            keyboard=confirm_create(),
+        )
+        ctx.set("state", "confirm_rfq")
+
+    async def confirm_handler(self, message: Message):
+        state = ctx.get("state")
+        if state != "confirm_rfq":
+            return
+
+        text = message.text.lower().strip()
+        if text in ["✅ подтвердить", "да", "подтвердить"]:
+            items = ctx.get("pending_items")
+            city = ctx.get("pending_city")
+            budget = ctx.get("pending_budget")
+            user_vk_id = message.from_id
+
+            await message.answer("Создаю заявку...", keyboard=main_menu())
+
+            rfq_id = await self.pg.create_rfq(
+                items, city, budget, created_by_vk=user_vk_id
+            )
+            await self.redis.publish_new_rfq(rfq_id, items)
+
+            await message.answer(
+                f"✅ Заявка #{rfq_id} создана.\n\n"
+                f"Позиций: {len(items)}\n"
+                f"Город: {city}\n\n"
+                "Начинается поиск поставщиков. Ориентировочное время "
+                "обработки — 25–40 минут.\n"
+                "Я буду присылать обновления по мере получения котировок.",
+                keyboard=main_menu(),
+            )
+        elif text in ["🔄 загрузить новый"]:
+            ctx.delete("state")
+            ctx.delete("pending_items")
+            ctx.delete("pending_city")
+            ctx.delete("pending_budget")
+            await self.new_rfq_handler(message)
+            return
+        else:
+            ctx.delete("state")
+            ctx.delete("pending_items")
+            ctx.delete("pending_city")
+            ctx.delete("pending_budget")
+            await message.answer(
+                "Создание заявки отменено.", keyboard=main_menu()
+            )
+
+        ctx.set("state", None)
+
+    async def _show_rfq_detail(self, message: Message, rfq_id: int):
+        """Показывает меню действий для конкретной заявки."""
+        # Проверяем доступ к заявке
+        user = await self.pg.get_user(message.from_id)
+        if not user:
+            await message.answer("Напишите «начать», чтобы начать.", keyboard=main_menu())
+            return
+
+        rfq = await self.pg.get_rfq_by_id(rfq_id)
+        if not rfq:
+            await message.answer(f"Заявка #{rfq_id} не найдена.", keyboard=main_menu())
+            return
+
+        # Проверяем, что заявка принадлежит пользователю
+        if rfq.get("created_by_vk") != message.from_id:
+            await message.answer("У вас нет доступа к этой заявке.", keyboard=main_menu())
+            return
+
+        # Сохраняем текущую заявку в контекст
+        ctx.set("current_rfq_id", rfq_id)
+
+        status = await self.pg.get_rfq_status(rfq_id)
+        total = status["total"]
+        winners = status["winners"]
+        ready = winners == total and total > 0
+
+        lines = [
+            f"📋 Заявка #{rfq_id}\n",
+            f"Позиций: {total}\n",
+            f"Победителей: {winners}\n",
+            f"Город: {rfq.get('city', '—')}\n",
+        ]
+
+        if ready:
+            lines.append("\n✅ Заявка завершена")
+        else:
+            lines.append("\n🔄 В работе")
+
+        await message.answer("\n".join(lines), keyboard=rfq_detail(rfq_id))
+
+    async def _get_or_create_user(self, vk_id: int, vk_name: str) -> User:
+        user = await self.pg.get_user(vk_id)
+        if not user:
+            user = await self.pg.create_user(vk_id, vk_name)
+        return user

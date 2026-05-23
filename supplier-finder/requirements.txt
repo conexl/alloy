@@ -1,0 +1,11 @@
+scrapling==0.2.7
+asyncpg==0.29.0
+redis==5.0.1
+python-dotenv==1.0.1
+aiohttp==3.9.3
+beautifulsoup4==4.12.3
+lxml==5.2.1
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0

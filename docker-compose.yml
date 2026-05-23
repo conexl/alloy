@@ -1,0 +1,196 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database
+  postgres:
+    image: postgres:16-alpine
+    container_name: tender-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tender
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tender-network
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: tender-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - tender-network
+
+  # Communication Service (Go)
+  communication-service:
+    build:
+      context: ./communication-service
+      dockerfile: Dockerfile
+    container_name: communication-service
+    environment:
+      DB_DSN: postgres://postgres:postgres@postgres:5432/tender?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      SMTP_HOST: ${SMTP_HOST:-smtp}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@tender.local}
+      IMAP_HOST: ${IMAP_HOST:-imap}
+      IMAP_PORT: ${IMAP_PORT:-993}
+      IMAP_USER: ${IMAP_USER:-test@localhost}
+      IMAP_PASS: ${IMAP_PASS:-test}
+      IMAP_FOLDER: ${IMAP_FOLDER:-INBOX}
+      IMAP_EXTRA_FOLDERS: ${IMAP_EXTRA_FOLDERS:-}
+      IMAP_POLL_INTERVAL: ${IMAP_POLL_INTERVAL:-300s}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      MAX_EMAILS_PER_ITEM: ${MAX_EMAILS_PER_ITEM:-5}
+      SMTP_DELAY: ${SMTP_DELAY:-1s}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tender-network
+    restart: unless-stopped
+
+  # Report Service (Python)
+  report-service:
+    build:
+      context: ./report-service
+      dockerfile: Dockerfile
+    container_name: report-service
+    environment:
+      DB_DSN: postgres://postgres:postgres@postgres:5432/tender?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      HTTP_PORT: 8081
+      MARGIN_PERCENT: 15
+      REPORT_DIR: /app/reports
+    ports:
+      - "8081:8081"
+    volumes:
+      - report_data:/app/reports
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tender-network
+    restart: unless-stopped
+
+  # VK Bot (Python)
+  vk-bot:
+    build:
+      context: ./vk-bot
+      dockerfile: Dockerfile
+    container_name: vk-bot
+    environment:
+      VK_GROUP_TOKEN: ${VK_GROUP_TOKEN}
+      VK_GROUP_ID: ${VK_GROUP_ID}
+      DB_DSN: postgres://postgres:postgres@postgres:5432/tender?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      REPORT_SERVICE_URL: http://report-service:8081
+      ADMIN_VK_IDS: ${ADMIN_VK_IDS:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tender-network
+    restart: unless-stopped
+
+  # Supplier Finder (Python)
+  supplier-finder:
+    build:
+      context: ./supplier-finder
+      dockerfile: Dockerfile
+    container_name: supplier-finder
+    environment:
+      DB_DSN: postgres://postgres:postgres@postgres:5432/tender?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      STREAM_RFQ: new_rfq
+      STREAM_RESULTS: suppliers_found
+      YANDEX_XML_USER: ${YANDEX_XML_USER:-}
+      YANDEX_XML_KEY: ${YANDEX_XML_KEY:-}
+      DDG_PROXY_USER: ${DDG_PROXY_USER:-}
+      DDG_PROXY_PASS: ${DDG_PROXY_PASS:-}
+      DDG_PROXY_LIST: ${DDG_PROXY_LIST:-}
+      MAX_URLS_PER_ITEM: 8
+      MAX_CONCURRENT_PARSERS: 4
+      ITEM_CONCURRENCY: 3
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - tender-network
+    restart: unless-stopped
+
+  # Web App Backend (FastAPI)
+  web-app-backend:
+    build:
+      context: ./web-app-backend
+      dockerfile: Dockerfile
+    container_name: web-app-backend
+    environment:
+      DB_DSN: postgres://postgres:postgres@postgres:5432/tender?sslmode=disable
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8002:8002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tender-network
+    restart: unless-stopped
+    volumes:
+      - report_data:/app/reports:ro
+
+  # VK Mini App (Frontend)
+  vk-mini-app:
+    build:
+      context: ./vk-mini-app
+      dockerfile: Dockerfile
+    container_name: vk-mini-app
+    ports:
+      - "3000:80"
+    depends_on:
+      - web-app-backend
+    networks:
+      - tender-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  report_data:
+
+networks:
+  tender-network:
+    driver: bridge
