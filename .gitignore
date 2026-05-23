@@ -73,6 +73,11 @@ communication-service/*.pyc
 report-service/__pycache__/
 report-service/*.pyc
 
+# Virtual environments
+.venv/
+venv/
+env/
+
 # Supplier finder
 supplier-finder/__pycache__/
 supplier-finder/*.pyc
